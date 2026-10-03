@@ -22,7 +22,9 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include "usbd_cdc_if.h"
+#include <string.h>
+#include <stdio.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -45,7 +47,11 @@ TIM_HandleTypeDef htim1;
 DMA_HandleTypeDef hdma_tim1_up;
 
 /* USER CODE BEGIN PV */
+uint8_t usb_rx_buf[64];
+volatile uint16_t usb_rx_len = 0;
+volatile uint8_t usb_rx_flag = 0;
 
+uint32_t last_heartbeat_time = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -54,11 +60,23 @@ static void MX_GPIO_Init(void);
 static void MX_DMA_Init(void);
 static void MX_TIM1_Init(void);
 /* USER CODE BEGIN PFP */
-
+uint8_t USB_Transmit_Safe(uint8_t *pData, uint16_t length);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
+uint8_t USB_Transmit_Safe(uint8_t *pData, uint16_t length)
+{
+    uint32_t timeout = 50000;
+    
+    while (CDC_Transmit_FS(pData, length) == USBD_BUSY){
+			if (--timeout == 0){
+				return 0;
+			}
+    }
+    return 1;
+}
 
 /* USER CODE END 0 */
 
@@ -95,13 +113,31 @@ int main(void)
   MX_TIM1_Init();
   MX_USB_DEVICE_Init();
   /* USER CODE BEGIN 2 */
-
+	HAL_Delay(1000); // Ch? USB PC ?n d?nh k?t n?i
+  char *boot_msg = "=== STM32 Logic Analyzer Ready ===\r\n";
+  USB_Transmit_Safe((uint8_t*)boot_msg, strlen(boot_msg));
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
+		if (usb_rx_flag == 1){
+			usb_rx_flag = 0;
+
+      char echo_prefix[] = "ECHO: ";
+      USB_Transmit_Safe((uint8_t*)echo_prefix, strlen(echo_prefix));
+      USB_Transmit_Safe(usb_rx_buf, usb_rx_len);
+      USB_Transmit_Safe((uint8_t*)"\r\n", 2);
+		}
+		
+		if (HAL_GetTick() - last_heartbeat_time >= 1000){
+			last_heartbeat_time = HAL_GetTick();
+
+      char heartbeat_msg[32];
+      snprintf(heartbeat_msg, sizeof(heartbeat_msg), "HEARTBEAT: %lu s\r\n", last_heartbeat_time / 1000);
+      USB_Transmit_Safe((uint8_t*)heartbeat_msg, strlen(heartbeat_msg));
+		}
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
