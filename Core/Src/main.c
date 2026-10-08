@@ -34,7 +34,8 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
+#define BUFFER_SIZE       32
+#define HALF_BUFFER_SIZE  (BUFFER_SIZE / 2)
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -44,10 +45,17 @@
 
 /* Private variables ---------------------------------------------------------*/
 TIM_HandleTypeDef htim1;
+TIM_HandleTypeDef htim2;
 DMA_HandleTypeDef hdma_tim1_up;
 
 /* USER CODE BEGIN PV */
-uint32_t last_heartbeat_time = 0;
+uint8_t capture_buffer[BUFFER_SIZE];
+
+volatile uint8_t flag_half_ready = 0;
+volatile uint8_t flag_full_ready = 0;
+
+char *hmsg = "\r\n=== Half Data ===\r\n";
+char *fmsg = "\r\n=== Full Data ===\r\n";
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -55,8 +63,15 @@ void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_DMA_Init(void);
 static void MX_TIM1_Init(void);
+static void MX_TIM2_Init(void);
 /* USER CODE BEGIN PFP */
 uint8_t USB_Transmit_Safe(uint8_t *pData, uint16_t length);
+
+void My_DMA_HalfConvCallback(DMA_HandleTypeDef *hdma);
+void My_DMA_FullConvCallback(DMA_HandleTypeDef *hdma);
+
+void LogicAnalyzer_StartCapture(void);
+void LogicAnalyzer_StopCapture(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -72,6 +87,33 @@ uint8_t USB_Transmit_Safe(uint8_t *pData, uint16_t length) {
 	return 1;
 }
 
+void My_DMA_HalfConvCallback(DMA_HandleTypeDef *hdma) {
+	flag_half_ready = 1;
+}
+
+void My_DMA_FullConvCallback(DMA_HandleTypeDef *hdma) {
+	flag_full_ready = 1;
+}
+
+void LogicAnalyzer_StartCapture(void){
+	flag_half_ready = 0;
+	flag_full_ready = 0;
+	
+	htim1.hdma[TIM_DMA_ID_UPDATE]->XferHalfCpltCallback = My_DMA_HalfConvCallback;
+	htim1.hdma[TIM_DMA_ID_UPDATE]->XferCpltCallback = My_DMA_FullConvCallback;
+	
+	HAL_DMA_Start_IT(htim1.hdma[TIM_DMA_ID_UPDATE], (uint32_t)&(GPIOB->IDR), (uint32_t)capture_buffer, BUFFER_SIZE);
+	
+	__HAL_TIM_SET_COUNTER(&htim1, 0);
+	__HAL_TIM_ENABLE_DMA(&htim1, TIM_DMA_UPDATE);
+	HAL_TIM_Base_Start(&htim1);
+}
+
+void LogicAnalyzer_StopCapture(void) {
+	HAL_TIM_Base_Stop(&htim1);
+	__HAL_TIM_DISABLE_DMA(&htim1, TIM_DMA_UPDATE);
+	HAL_DMA_Abort(htim1.hdma[TIM_DMA_ID_UPDATE]);
+}
 /* USER CODE END 0 */
 
 /**
@@ -106,31 +148,33 @@ int main(void)
   MX_DMA_Init();
   MX_TIM1_Init();
   MX_USB_DEVICE_Init();
+  MX_TIM2_Init();
   /* USER CODE BEGIN 2 */
-	HAL_Delay(1000);
-  char *boot_msg = "=== STM32 Logic Analyzer Ready ===\r\n";
+	HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1);
+	HAL_Delay(2000);
+	char *boot_msg = "=== STM32 Logic Analyzer Ready ===\r\n";
   USB_Transmit_Safe((uint8_t*)boot_msg, strlen(boot_msg));
+
+  boot_msg = "=== StartCapture ===\r\n";
+  USB_Transmit_Safe((uint8_t*)boot_msg, strlen(boot_msg));
+  LogicAnalyzer_StartCapture();
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-		if (usb_rx_flag == 1){
-			usb_rx_flag = 0;
-
-      char echo_prefix[] = "ECHO: ";
-      USB_Transmit_Safe((uint8_t*)echo_prefix, strlen(echo_prefix));
-      USB_Transmit_Safe(usb_rx_buf, usb_rx_len);
-      USB_Transmit_Safe((uint8_t*)"\r\n", 2);
-		}
+    if (flag_half_ready == 1) {
+      flag_half_ready = 0;
+      USB_Transmit_Safe((uint8_t*)hmsg, strlen(hmsg));
+			USB_Transmit_Safe((uint8_t*)&capture_buffer[0], HALF_BUFFER_SIZE);
+    }
 		
-		if (HAL_GetTick() - last_heartbeat_time >= 1000){
-			last_heartbeat_time = HAL_GetTick();
-
-      char heartbeat_msg[32];
-      snprintf(heartbeat_msg, sizeof(heartbeat_msg), "HEARTBEAT: %u s\r\n", last_heartbeat_time / 1000);
-      USB_Transmit_Safe((uint8_t*)heartbeat_msg, strlen(heartbeat_msg));
+		if (flag_full_ready == 1) {
+			flag_full_ready = 0;
+			char *stop_msg = "\r\n=== Half Data ===\r\n";
+      USB_Transmit_Safe((uint8_t*)fmsg, strlen(fmsg));
+			USB_Transmit_Safe((uint8_t*)&capture_buffer[HALF_BUFFER_SIZE], HALF_BUFFER_SIZE);
 		}
     /* USER CODE END WHILE */
 
@@ -206,7 +250,7 @@ static void MX_TIM1_Init(void)
 
   /* USER CODE END TIM1_Init 1 */
   htim1.Instance = TIM1;
-  htim1.Init.Prescaler = 71;
+  htim1.Init.Prescaler = 719;
   htim1.Init.CounterMode = TIM_COUNTERMODE_UP;
   htim1.Init.Period = 9;
   htim1.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
@@ -232,7 +276,7 @@ static void MX_TIM1_Init(void)
     Error_Handler();
   }
   sConfigOC.OCMode = TIM_OCMODE_PWM1;
-  sConfigOC.Pulse = 5;
+  sConfigOC.Pulse = 0;
   sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
   sConfigOC.OCNPolarity = TIM_OCNPOLARITY_HIGH;
   sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
@@ -257,6 +301,65 @@ static void MX_TIM1_Init(void)
 
   /* USER CODE END TIM1_Init 2 */
   HAL_TIM_MspPostInit(&htim1);
+
+}
+
+/**
+  * @brief TIM2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM2_Init(void)
+{
+
+  /* USER CODE BEGIN TIM2_Init 0 */
+
+  /* USER CODE END TIM2_Init 0 */
+
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+  TIM_OC_InitTypeDef sConfigOC = {0};
+
+  /* USER CODE BEGIN TIM2_Init 1 */
+
+  /* USER CODE END TIM2_Init 1 */
+  htim2.Instance = TIM2;
+  htim2.Init.Prescaler = 719;
+  htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim2.Init.Period = 999;
+  htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim2, &sClockSourceConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_TIM_PWM_Init(&htim2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sConfigOC.OCMode = TIM_OCMODE_PWM1;
+  sConfigOC.Pulse = 500;
+  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+  if (HAL_TIM_PWM_ConfigChannel(&htim2, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM2_Init 2 */
+
+  /* USER CODE END TIM2_Init 2 */
+  HAL_TIM_MspPostInit(&htim2);
 
 }
 
@@ -290,8 +393,8 @@ static void MX_GPIO_Init(void)
 
   /* GPIO Ports Clock Enable */
   __HAL_RCC_GPIOD_CLK_ENABLE();
-  __HAL_RCC_GPIOB_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
 
   /*Configure GPIO pins : PB0 PB1 PB2 PB3
                            PB4 PB5 PB6 PB7 */
