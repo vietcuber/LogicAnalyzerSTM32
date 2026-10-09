@@ -263,6 +263,7 @@ static int8_t CDC_Receive_FS(uint8_t* Buf, uint32_t *Len)
   /* USER CODE BEGIN 6 */
 	if (*Len > 0 && *Len < 64){
 		memcpy(usb_rx_buf, Buf, *Len);
+		usb_rx_buf[*Len] = '\0';
     usb_rx_len = *Len;
     usb_rx_flag = 1;
 	}

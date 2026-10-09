@@ -29,13 +29,24 @@
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
+typedef enum {
+	MODE_STREAMING,
+	MODE_SNAPSHOT
+} CaptureMode_t;
 
+typedef struct {
+	uint32_t freq;
+	uint16_t psc;
+	uint16_t arr;
+} FreqConfig_t;
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define BUFFER_SIZE       32
+#define BUFFER_SIZE       10240
 #define HALF_BUFFER_SIZE  (BUFFER_SIZE / 2)
+#define NUM_FREQS (sizeof(Freq_LUT) / sizeof(Freq_LUT[0]))
+#define NUM_ALLOWED_SAMPLES (sizeof(ALLOWED_SAMPLES) / sizeof(ALLOWED_SAMPLES[0]))
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -53,9 +64,46 @@ uint8_t capture_buffer[BUFFER_SIZE];
 
 volatile uint8_t flag_half_ready = 0;
 volatile uint8_t flag_full_ready = 0;
+volatile uint8_t flag_snapshot_done = 0;
+
+volatile uint8_t flag_capturing = 0;
+uint8_t flag_configured = 0;
+
+CaptureMode_t current_mode = MODE_STREAMING;
+
+uint32_t target_samples = 0;
+uint32_t samples_captured = 0;
+
+const FreqConfig_t Freq_LUT[] = {
+	{          1,   1199,   59999 },
+  {          2,    599,   59999 },
+  {          5,    239,   59999 },
+  {         10,    119,   59999 },
+  {         20,     59,   59999 },
+  {         50,     23,   59999 },
+  {        100,     11,   59999 },
+  {        200,      5,   59999 },
+  {        500,      2,   47999 },
+  {       1000,      1,   35999 },
+  {       2000,      0,   35999 },
+  {       5000,      0,   14399 },
+  {      10000,      0,    7199 },
+  {      20000,      0,    3599 },
+  {      50000,      0,    1439 },
+  {     100000,      0,     719 },
+  {     200000,      0,     359 },
+  {     500000,      0,     143 },
+  {    1000000,      0,      71 },
+  {    2000000,      0,      35 }
+};
+const uint32_t ALLOWED_SAMPLES[] = {100, 200, 500, 1000, 2000, 5000, 10000, 20000, 50000, 100000};
+
 
 char *hmsg = "\r\n=== Half Data ===\r\n";
 char *fmsg = "\r\n=== Full Data ===\r\n";
+char *startmsg = "\r\n=== Start Capture ===\r\n";
+char *stopmsg = "\r\n=== Stop Capture ===\r\n";
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -72,6 +120,8 @@ void My_DMA_FullConvCallback(DMA_HandleTypeDef *hdma);
 
 void LogicAnalyzer_StartCapture(void);
 void LogicAnalyzer_StopCapture(void);
+
+uint8_t Validate_And_Set_Config(uint32_t freq, uint32_t samples);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -114,6 +164,49 @@ void LogicAnalyzer_StopCapture(void) {
 	__HAL_TIM_DISABLE_DMA(&htim1, TIM_DMA_UPDATE);
 	HAL_DMA_Abort(htim1.hdma[TIM_DMA_ID_UPDATE]);
 }
+
+uint8_t Validate_And_Set_Config(uint32_t freq, uint32_t samples) {
+	int freq_index = -1;
+	uint8_t flag_sample_valid = 0;
+	
+	for (uint8_t i = 0; i < NUM_FREQS; i++) {
+		if (freq == Freq_LUT[i].freq) {
+			freq_index = i;
+			break;
+		}
+	}
+	
+	for (uint8_t i = 0; i < NUM_ALLOWED_SAMPLES; i++) {
+		if (samples == ALLOWED_SAMPLES[i]) {
+			flag_sample_valid = 1;
+			break;
+		}
+	}
+	
+	if (freq_index == -1 || !flag_sample_valid) {
+		return 1; //loi 1: tham so khong nam trong dai quy dinh
+	}
+	
+	if (freq >= 500000) {
+		if (samples > BUFFER_SIZE) {
+			return 2; // loi 2: che do snapshot nhung samples vuot qua buffer
+		}
+		current_mode = MODE_SNAPSHOT;
+	}
+	else {
+		current_mode = MODE_STREAMING;
+	}
+	
+	target_samples = samples;
+	
+	htim1.Instance->PSC = Freq_LUT[freq_index].psc;
+	htim1.Instance->ARR = Freq_LUT[freq_index].arr;
+	htim1.Instance->EGR = TIM_EGR_UG;
+	htim1.Instance->SR = ~TIM_SR_UIF;
+
+	flag_configured = 1;
+	return 0;
+}
 /* USER CODE END 0 */
 
 /**
@@ -153,11 +246,8 @@ int main(void)
 	HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1);
 	HAL_Delay(2000);
 	char *boot_msg = "=== STM32 Logic Analyzer Ready ===\r\n";
-  USB_Transmit_Safe((uint8_t*)boot_msg, strlen(boot_msg));
-
-  boot_msg = "=== StartCapture ===\r\n";
-  USB_Transmit_Safe((uint8_t*)boot_msg, strlen(boot_msg));
-  LogicAnalyzer_StartCapture();
+	USB_Transmit_Safe((uint8_t*)boot_msg, strlen(boot_msg));
+	Validate_And_Set_Config(10000, 5000);
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -169,10 +259,8 @@ int main(void)
       USB_Transmit_Safe((uint8_t*)hmsg, strlen(hmsg));
 			USB_Transmit_Safe((uint8_t*)&capture_buffer[0], HALF_BUFFER_SIZE);
     }
-		
 		if (flag_full_ready == 1) {
 			flag_full_ready = 0;
-			char *stop_msg = "\r\n=== Half Data ===\r\n";
       USB_Transmit_Safe((uint8_t*)fmsg, strlen(fmsg));
 			USB_Transmit_Safe((uint8_t*)&capture_buffer[HALF_BUFFER_SIZE], HALF_BUFFER_SIZE);
 		}
