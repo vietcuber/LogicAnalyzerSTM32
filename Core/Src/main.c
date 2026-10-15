@@ -44,6 +44,7 @@ typedef struct {
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 #define BUFFER_SIZE       10240
+#define CMD_BUFFER_SIZE		32	
 #define HALF_BUFFER_SIZE  (BUFFER_SIZE / 2)
 #define NUM_FREQS (sizeof(Freq_LUT) / sizeof(Freq_LUT[0]))
 #define NUM_ALLOWED_SAMPLES (sizeof(ALLOWED_SAMPLES) / sizeof(ALLOWED_SAMPLES[0]))
@@ -61,13 +62,14 @@ DMA_HandleTypeDef hdma_tim1_up;
 
 /* USER CODE BEGIN PV */
 uint8_t capture_buffer[BUFFER_SIZE];
-
+char cmd_buffer[CMD_BUFFER_SIZE];
 volatile uint8_t flag_half_ready = 0;
 volatile uint8_t flag_full_ready = 0;
 volatile uint8_t flag_snapshot_done = 0;
-
 volatile uint8_t flag_capturing = 0;
 uint8_t flag_configured = 0;
+
+volatile uint8_t flag_cmd_ready = 0;
 
 CaptureMode_t current_mode = MODE_STREAMING;
 
@@ -103,6 +105,12 @@ char *hmsg = "\r\n=== Half Data ===\r\n";
 char *fmsg = "\r\n=== Full Data ===\r\n";
 char *startmsg = "\r\n=== Start Capture ===\r\n";
 char *stopmsg = "\r\n=== Stop Capture ===\r\n";
+char *ncfgmsg = "\r\n=== Not configured yet ===\r\n";
+char *cfgmsg = "\r\n=== Configured Successfully ===\r\n";
+char *rcfgmsg = "\r\n=== Reconfigured Successfully ===\r\n";
+char *invselmsg = "\r\n=== Invalid Selection ===\r\n";
+char *snapoutmsg = "\r\n=== Snapshot Parameter Out Of Range ===\r\n";
+
 
 /* USER CODE END PV */
 
@@ -122,6 +130,8 @@ void LogicAnalyzer_StartCapture(void);
 void LogicAnalyzer_StopCapture(void);
 
 uint8_t Validate_And_Set_Config(uint32_t freq, uint32_t samples);
+
+void Process_Command(const char *cmd);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -145,7 +155,7 @@ void My_DMA_FullConvCallback(DMA_HandleTypeDef *hdma) {
 	flag_full_ready = 1;
 }
 
-void LogicAnalyzer_StartCapture(void){
+void LogicAnalyzer_StartCapture(void) {
 	flag_half_ready = 0;
 	flag_full_ready = 0;
 	
@@ -168,14 +178,14 @@ void LogicAnalyzer_StopCapture(void) {
 uint8_t Validate_And_Set_Config(uint32_t freq, uint32_t samples) {
 	int freq_index = -1;
 	uint8_t flag_sample_valid = 0;
-	
+	//Check tan so so thu may trong bang
 	for (uint8_t i = 0; i < NUM_FREQS; i++) {
 		if (freq == Freq_LUT[i].freq) {
 			freq_index = i;
 			break;
 		}
 	}
-	
+	//Check so mau thu may trong bang
 	for (uint8_t i = 0; i < NUM_ALLOWED_SAMPLES; i++) {
 		if (samples == ALLOWED_SAMPLES[i]) {
 			flag_sample_valid = 1;
@@ -205,8 +215,73 @@ uint8_t Validate_And_Set_Config(uint32_t freq, uint32_t samples) {
 	htim1.Instance->SR = ~TIM_SR_UIF;
 
 	flag_configured = 1;
-	return 0;
+	return 0; //Nap tan so va so mau thanh cong
 }
+
+void Process_Command(const char *cmd) {
+	//Re nhanh check CMD la START hay CONFIGURE
+	if (*cmd == 'S') {
+		if (flag_configured == 1) { // Check da cau hinh hay chua
+			samples_captured = 0;
+			flag_capturing = 1;
+			USB_Transmit_Safe((uint8_t*)startmsg, strlen(startmsg));
+			LogicAnalyzer_StartCapture();
+		}
+		else if (flag_configured == 0) { // Neu chua cau hinh thi in loi
+			USB_Transmit_Safe((uint8_t*)ncfgmsg, strlen(ncfgmsg));
+		}
+	}
+	//Re nhanh check CMD la START hay CONFIG
+	// Example: CONFIGURE 10000 5000
+	else if (*cmd == 'C') {
+		uint32_t cmd_freq = 0;
+		uint32_t cmd_samples = 0;
+		cmd += 10; // nhay den so thu nhat
+		//Vong lap lay so thu nhat
+		while (*cmd >= '0' && *cmd <= '9') {
+			cmd_freq = cmd_freq * 10 + (*cmd - '0');
+			cmd++;
+		}
+		cmd++; //Bo qua khoang trang giua tan so va so mau
+		//Vong lap lay so thu hai
+		while (*cmd >= '0' && *cmd <= '9') {
+			cmd_samples = cmd_samples * 10 + (*cmd - '0');
+			cmd++;
+		}
+		
+		if (flag_configured == 1) {
+			switch (Validate_And_Set_Config(cmd_freq, cmd_samples)) {
+				case 0:
+					USB_Transmit_Safe((uint8_t*)rcfgmsg, strlen(rcfgmsg)); //Thong bao da config lai thanh cong
+					break;
+				case 1:
+					USB_Transmit_Safe((uint8_t*)invselmsg,strlen(invselmsg)); //Thong bao da config sai tham so
+					break;
+				case 2:
+					USB_Transmit_Safe((uint8_t*)snapoutmsg,strlen(snapoutmsg)); //Thong bao da config sai tham so o che do snapshot
+					break;
+				default:
+					break;
+			}
+		}
+		else if (flag_configured == 0) {
+			switch (Validate_And_Set_Config(cmd_freq, cmd_samples)) {
+				case 0:
+					USB_Transmit_Safe((uint8_t*)cfgmsg, strlen(cfgmsg)); //Thong bao da config thanh cong
+					break;
+				case 1:
+					USB_Transmit_Safe((uint8_t*)invselmsg,strlen(invselmsg)); //Thong bao da config sai tham so
+					break;
+				case 2:
+					USB_Transmit_Safe((uint8_t*)snapoutmsg,strlen(snapoutmsg)); //Thong bao da config sai tham so o che do snapshot
+					break;
+				default:
+					break;
+			}
+		}
+	}
+}
+
 /* USER CODE END 0 */
 
 /**
@@ -247,22 +322,44 @@ int main(void)
 	HAL_Delay(2000);
 	char *boot_msg = "=== STM32 Logic Analyzer Ready ===\r\n";
 	USB_Transmit_Safe((uint8_t*)boot_msg, strlen(boot_msg));
-	Validate_And_Set_Config(10000, 5000);
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-    if (flag_half_ready == 1) {
-      flag_half_ready = 0;
-      USB_Transmit_Safe((uint8_t*)hmsg, strlen(hmsg));
+    // 1. Ki?m tra và x? lý l?nh g?i t? Hercules
+		if (flag_cmd_ready == 1) {
+			flag_cmd_ready = 0;
+			Process_Command(cmd_buffer);
+		}
+
+		// 2. X? lý khi n?a d?u buffer d?y (5120 m?u)
+		if (flag_half_ready == 1) {
+			flag_half_ready = 0;
+			USB_Transmit_Safe((uint8_t*)hmsg, strlen(hmsg));
 			USB_Transmit_Safe((uint8_t*)&capture_buffer[0], HALF_BUFFER_SIZE);
-    }
+
+			samples_captured += HALF_BUFFER_SIZE;
+			if (samples_captured >= target_samples) {
+				LogicAnalyzer_StopCapture();
+				flag_capturing = 0;
+				USB_Transmit_Safe((uint8_t*)stopmsg, strlen(stopmsg));
+			}
+		}
+
+		// 3. X? lý khi n?a sau buffer d?y (5120 m?u)
 		if (flag_full_ready == 1) {
 			flag_full_ready = 0;
-      USB_Transmit_Safe((uint8_t*)fmsg, strlen(fmsg));
+			USB_Transmit_Safe((uint8_t*)fmsg, strlen(fmsg));
 			USB_Transmit_Safe((uint8_t*)&capture_buffer[HALF_BUFFER_SIZE], HALF_BUFFER_SIZE);
+
+			samples_captured += HALF_BUFFER_SIZE;
+			if (samples_captured >= target_samples) {
+				LogicAnalyzer_StopCapture();
+				flag_capturing = 0;
+				USB_Transmit_Safe((uint8_t*)stopmsg, strlen(stopmsg));
+			}
 		}
     /* USER CODE END WHILE */
 

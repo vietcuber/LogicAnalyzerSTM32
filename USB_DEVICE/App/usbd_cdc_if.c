@@ -34,6 +34,11 @@
 uint8_t usb_rx_buf[64];
 volatile uint16_t usb_rx_len;
 volatile uint8_t usb_rx_flag;
+
+#define CMD_BUFFER_SIZE 32
+extern char cmd_buffer[CMD_BUFFER_SIZE];
+extern volatile uint8_t flag_cmd_ready;
+
 /* USER CODE END PV */
 
 /** @addtogroup STM32_USB_OTG_DEVICE_LIBRARY
@@ -261,11 +266,10 @@ static int8_t CDC_Control_FS(uint8_t cmd, uint8_t* pbuf, uint16_t length)
 static int8_t CDC_Receive_FS(uint8_t* Buf, uint32_t *Len)
 {
   /* USER CODE BEGIN 6 */
-	if (*Len > 0 && *Len < 64){
-		memcpy(usb_rx_buf, Buf, *Len);
-		usb_rx_buf[*Len] = '\0';
-    usb_rx_len = *Len;
-    usb_rx_flag = 1;
+	if (*Len > 0 && *Len < CMD_BUFFER_SIZE){
+		memcpy(cmd_buffer, Buf, *Len);
+		cmd_buffer[*Len] = '\0';
+    flag_cmd_ready = 1;
 	}
 	
   USBD_CDC_SetRxBuffer(&hUsbDeviceFS, &Buf[0]);
