@@ -39,6 +39,15 @@ typedef struct {
 	uint16_t psc;
 	uint16_t arr;
 } FreqConfig_t;
+
+#pragma pack(push, 1)  // Ép compiler đóng gói chặt 1-byte, không chèn byte rác căn lề
+typedef struct {
+    uint8_t  magic[2]; // 0xAA, 0x55 (Mốc đồng bộ nhận diện đầu gói)
+    uint8_t  pkt_type; // 0x01: Streaming, 0x02: Snapshot
+    uint8_t  seq_num;  // Số thứ tự gói (0 - 255)
+    uint16_t data_len; // Chiều dài dữ liệu thực tế theo sau (tính bằng byte)
+} PacketHeader_t;
+#pragma pack(pop)
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -101,16 +110,19 @@ const FreqConfig_t Freq_LUT[] = {
 const uint32_t ALLOWED_SAMPLES[] = {100, 200, 500, 1000, 2000, 5000, 10000, 20000, 50000, 100000};
 
 
-char *hmsg = "\r\n=== Half Data ===\r\n";
-char *fmsg = "\r\n=== Full Data ===\r\n";
-char *startmsg = "\r\n=== Start Capture ===\r\n";
-char *stopmsg = "\r\n=== Stop Capture ===\r\n";
-char *ncfgmsg = "\r\n=== Not configured yet ===\r\n";
-char *cfgmsg = "\r\n=== Configured Successfully ===\r\n";
-char *rcfgmsg = "\r\n=== Reconfigured Successfully ===\r\n";
-char *invselmsg = "\r\n=== Invalid Selection ===\r\n";
-char *snapoutmsg = "\r\n=== Snapshot Parameter Out Of Range ===\r\n";
+char *hmsg = "Half Data";
+char *fmsg = "Full Data";
+char *startmsg = "Start Capture";
+char *stopmsg = "Stop Capture";
+char *ncfgmsg = "Not configured yet";
+char *cfgmsg = "Configured Successfully";
+char *rcfgmsg = "Reconfigured Successfully";
+char *invselmsg = "Invalid Selection";
+char *snapoutmsg = "Snapshot Parameter Out Of Range";
 
+// Biến tĩnh dùng chung để gửi Header
+static PacketHeader_t tx_header = { {0xAA, 0x55}, 0, 0, 0 };
+static uint8_t global_seq = 0;
 
 /* USER CODE END PV */
 
@@ -122,6 +134,7 @@ static void MX_TIM1_Init(void);
 static void MX_TIM2_Init(void);
 /* USER CODE BEGIN PFP */
 uint8_t USB_Transmit_Safe(uint8_t *pData, uint16_t length);
+uint8_t Send_Data_Packet(uint8_t type, uint8_t *pData, uint16_t length);
 
 void My_DMA_HalfConvCallback(DMA_HandleTypeDef *hdma);
 void My_DMA_FullConvCallback(DMA_HandleTypeDef *hdma);
@@ -132,19 +145,49 @@ void LogicAnalyzer_StopCapture(void);
 uint8_t Validate_And_Set_Config(uint32_t freq, uint32_t samples);
 
 void Process_Command(const char *cmd);
+
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
 uint8_t USB_Transmit_Safe(uint8_t *pData, uint16_t length) {
-	uint32_t timeout = 50000;
-	while (CDC_Transmit_FS(pData, length) == USBD_BUSY) {
-		if (--timeout == 0) {
-			return 0;
-		}
-   }
-	return 1;
+  extern USBD_HandleTypeDef hUsbDeviceFS;
+  USBD_CDC_HandleTypeDef *hcdc = (USBD_CDC_HandleTypeDef*)hUsbDeviceFS.pClassData;
+
+  // Chờ CDC rảnh (tối đa 50ms)
+  uint32_t tickstart = HAL_GetTick();
+  while (CDC_Transmit_FS(pData, length) == USBD_BUSY) {
+    if ((HAL_GetTick()  - tickstart) > 50) {
+      return 1; //Lỗi USB bận quá lâu
+    }
+  }
+
+  // Nếu CDC đã rảnh, chờ PHẦN CỨNG gửi gói tin hiện tại ra ngoài rồi mới nạp gói tin mới (50ms)
+  tickstart = HAL_GetTick();
+  while (hcdc != NULL && hcdc->TxState != 0) {
+    if ((HAL_GetTick() - tickstart) > 50) {
+        return 2; // Lỗi Phần cứng không hoàn tất truyền;
+    }
+  }
+
+  return 0; //Truyền thành công
+}
+
+uint8_t Send_Data_Packet(uint8_t type, uint8_t *pData, uint16_t length) {
+  tx_header.pkt_type = type;
+  tx_header.seq_num = global_seq++;
+  tx_header.data_len = length;
+
+  //Gửi 6 bytes Header
+  if (USB_Transmit_Safe((uint8_t*)tx_header, sizeof(PacketHeader_t)) != 0) {
+    return 1; //Truyền Header thất bại
+  }
+  //Gửi dữ liệu thực tế
+  if (USB_Transmit_Safe(pData, length) != 0) {
+    return 2; //Truyền dữ liệu thất bại
+  }
+  return 0; //Truyền thành công
 }
 
 void My_DMA_HalfConvCallback(DMA_HandleTypeDef *hdma) {
@@ -328,13 +371,11 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-    // 1. Ki?m tra v� x? l� l?nh g?i t? Hercules
 		if (flag_cmd_ready == 1) {
 			flag_cmd_ready = 0;
 			Process_Command(cmd_buffer);
 		}
 
-		// 2. X? l� khi n?a d?u buffer d?y (5120 m?u)
 		if (flag_half_ready == 1) {
 			flag_half_ready = 0;
 			USB_Transmit_Safe((uint8_t*)hmsg, strlen(hmsg));
@@ -348,7 +389,6 @@ int main(void)
 			}
 		}
 
-		// 3. X? l� khi n?a sau buffer d?y (5120 m?u)
 		if (flag_full_ready == 1) {
 			flag_full_ready = 0;
 			USB_Transmit_Safe((uint8_t*)fmsg, strlen(fmsg));
