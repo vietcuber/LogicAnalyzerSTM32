@@ -23,6 +23,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "usbd_cdc_if.h"
+#include <stdint.h>
 #include <string.h>
 #include <stdio.h>
 /* USER CODE END Includes */
@@ -119,6 +120,7 @@ char *cfgmsg = "Configured Successfully";
 char *rcfgmsg = "Reconfigured Successfully";
 char *invselmsg = "Invalid Selection";
 char *snapoutmsg = "Snapshot Parameter Out Of Range";
+char *emsg = "Error";
 
 // Biến tĩnh dùng chung để gửi Header
 static PacketHeader_t tx_header = { {0xAA, 0x55}, 0, 0, 0 };
@@ -139,7 +141,7 @@ uint8_t Send_Data_Packet(uint8_t type, uint8_t *pData, uint16_t length);
 void My_DMA_HalfConvCallback(DMA_HandleTypeDef *hdma);
 void My_DMA_FullConvCallback(DMA_HandleTypeDef *hdma);
 
-void LogicAnalyzer_StartCapture(void);
+HAL_StatusTypeDef LogicAnalyzer_StartCapture(void);
 void LogicAnalyzer_StopCapture(void);
 
 uint8_t Validate_And_Set_Config(uint32_t freq, uint32_t samples);
@@ -180,7 +182,7 @@ uint8_t Send_Data_Packet(uint8_t type, uint8_t *pData, uint16_t length) {
   tx_header.data_len = length;
 
   //Gửi 6 bytes Header
-  if (USB_Transmit_Safe((uint8_t*)tx_header, sizeof(PacketHeader_t)) != 0) {
+  if (USB_Transmit_Safe((uint8_t*)&tx_header, sizeof(PacketHeader_t)) != 0) {
     return 1; //Truyền Header thất bại
   }
   //Gửi dữ liệu thực tế
@@ -191,25 +193,80 @@ uint8_t Send_Data_Packet(uint8_t type, uint8_t *pData, uint16_t length) {
 }
 
 void My_DMA_HalfConvCallback(DMA_HandleTypeDef *hdma) {
-	flag_half_ready = 1;
+  if (current_mode == MODE_STREAMING) {
+    flag_half_ready = 1U;
+  }
 }
 
 void My_DMA_FullConvCallback(DMA_HandleTypeDef *hdma) {
-	flag_full_ready = 1;
+	if (current_mode == MODE_SNAPSHOT) {
+    flag_snapshot_done = 1U;
+  }
+  else {
+    flag_full_ready = 1U;
+  }
 }
 
-void LogicAnalyzer_StartCapture(void) {
-	flag_half_ready = 0;
-	flag_full_ready = 0;
-	
-	htim1.hdma[TIM_DMA_ID_UPDATE]->XferHalfCpltCallback = My_DMA_HalfConvCallback;
-	htim1.hdma[TIM_DMA_ID_UPDATE]->XferCpltCallback = My_DMA_FullConvCallback;
-	
-	HAL_DMA_Start_IT(htim1.hdma[TIM_DMA_ID_UPDATE], (uint32_t)&(GPIOB->IDR), (uint32_t)capture_buffer, BUFFER_SIZE);
-	
-	__HAL_TIM_SET_COUNTER(&htim1, 0);
-	__HAL_TIM_ENABLE_DMA(&htim1, TIM_DMA_UPDATE);
-	HAL_TIM_Base_Start(&htim1);
+HAL_StatusTypeDef LogicAnalyzer_StartCapture(void) {
+    DMA_HandleTypeDef *hdma = htim1.hdma[TIM_DMA_ID_UPDATE];
+    uint32_t dma_length;
+
+    if (hdma == NULL || hdma->State == HAL_DMA_STATE_BUSY)
+    {
+        return HAL_ERROR;
+    }
+
+    if (current_mode == MODE_SNAPSHOT)
+    {
+        if (target_samples == 0U || target_samples > BUFFER_SIZE)
+        {
+            return HAL_ERROR;
+        }
+
+        hdma->Init.Mode = DMA_NORMAL;
+        dma_length = target_samples;
+    }
+    else
+    {
+        hdma->Init.Mode = DMA_CIRCULAR;
+        dma_length = BUFFER_SIZE;
+    }
+
+    HAL_TIM_Base_Stop(&htim1);
+    __HAL_TIM_DISABLE_DMA(&htim1, TIM_DMA_UPDATE);
+
+    if (HAL_DMA_Init(hdma) != HAL_OK)
+    {
+        return HAL_ERROR;
+    }
+
+    flag_half_ready = 0U;
+    flag_full_ready = 0U;
+    flag_snapshot_done = 0U;
+
+    hdma->XferHalfCpltCallback = My_DMA_HalfConvCallback;
+    hdma->XferCpltCallback = My_DMA_FullConvCallback;
+
+    if (HAL_DMA_Start_IT(hdma,
+                         (uint32_t)&GPIOB->IDR,
+                         (uint32_t)capture_buffer,
+                         dma_length) != HAL_OK)
+    {
+        return HAL_ERROR;
+    }
+
+    __HAL_TIM_SET_COUNTER(&htim1, 0U);
+    __HAL_TIM_CLEAR_FLAG(&htim1, TIM_FLAG_UPDATE);
+    __HAL_TIM_ENABLE_DMA(&htim1, TIM_DMA_UPDATE);
+
+    if (HAL_TIM_Base_Start(&htim1) != HAL_OK)
+    {
+        __HAL_TIM_DISABLE_DMA(&htim1, TIM_DMA_UPDATE);
+        (void)HAL_DMA_Abort(hdma);
+        return HAL_ERROR;
+    }
+
+    return HAL_OK;
 }
 
 void LogicAnalyzer_StopCapture(void) {
@@ -267,8 +324,12 @@ void Process_Command(const char *cmd) {
 		if (flag_configured == 1) { // Check da cau hinh hay chua
 			samples_captured = 0;
 			flag_capturing = 1;
-			USB_Transmit_Safe((uint8_t*)startmsg, strlen(startmsg));
-			LogicAnalyzer_StartCapture();
+      if (LogicAnalyzer_StartCapture() == HAL_OK) {
+        USB_Transmit_Safe((uint8_t*)startmsg, strlen(startmsg));
+      }
+      else {
+        USB_Transmit_Safe((uint8_t*)emsg, strlen(emsg));
+      }
 		}
 		else if (flag_configured == 0) { // Neu chua cau hinh thi in loi
 			USB_Transmit_Safe((uint8_t*)ncfgmsg, strlen(ncfgmsg));
@@ -371,36 +432,55 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-		if (flag_cmd_ready == 1) {
-			flag_cmd_ready = 0;
-			Process_Command(cmd_buffer);
-		}
+		if (flag_cmd_ready == 1U) {
+      flag_cmd_ready = 0U;
+      Process_Command(cmd_buffer);
+    }
 
-		if (flag_half_ready == 1) {
-			flag_half_ready = 0;
-			USB_Transmit_Safe((uint8_t*)hmsg, strlen(hmsg));
-			USB_Transmit_Safe((uint8_t*)&capture_buffer[0], HALF_BUFFER_SIZE);
+    if (current_mode == MODE_SNAPSHOT) {
+      if (flag_snapshot_done == 1U) {
+        flag_snapshot_done = 0U;
 
-			samples_captured += HALF_BUFFER_SIZE;
-			if (samples_captured >= target_samples) {
-				LogicAnalyzer_StopCapture();
-				flag_capturing = 0;
-				USB_Transmit_Safe((uint8_t*)stopmsg, strlen(stopmsg));
-			}
-		}
+        HAL_TIM_Base_Stop(&htim1);
+        __HAL_TIM_DISABLE_DMA(&htim1, TIM_DMA_UPDATE);
 
-		if (flag_full_ready == 1) {
-			flag_full_ready = 0;
-			USB_Transmit_Safe((uint8_t*)fmsg, strlen(fmsg));
-			USB_Transmit_Safe((uint8_t*)&capture_buffer[HALF_BUFFER_SIZE], HALF_BUFFER_SIZE);
+        flag_capturing = 0U;
+        samples_captured = target_samples;
 
-			samples_captured += HALF_BUFFER_SIZE;
-			if (samples_captured >= target_samples) {
-				LogicAnalyzer_StopCapture();
-				flag_capturing = 0;
-				USB_Transmit_Safe((uint8_t*)stopmsg, strlen(stopmsg));
-			}
-		}
+        USB_Transmit_Safe(capture_buffer, (uint16_t)target_samples);
+        USB_Transmit_Safe((uint8_t*)stopmsg, strlen(stopmsg));
+      }
+      else {
+        if (flag_half_ready == 1) {
+          flag_half_ready = 0U;
+
+          USB_Transmit_Safe((uint8_t*)hmsg, strlen(hmsg));
+          USB_Transmit_Safe(capture_buffer, HALF_BUFFER_SIZE);
+
+          samples_captured += HALF_BUFFER_SIZE;
+
+          if (samples_captured >= target_samples) {
+            LogicAnalyzer_StopCapture();
+            flag_capturing = 0U;
+            USB_Transmit_Safe((uint8_t*)stopmsg, strlen(stopmsg));
+          }
+        }
+        if (flag_full_ready == 1U) {
+          flag_full_ready = 0U;
+
+          USB_Transmit_Safe((uint8_t*)fmsg, strlen(fmsg));
+          USB_Transmit_Safe(&capture_buffer[HALF_BUFFER_SIZE], HALF_BUFFER_SIZE);
+
+          samples_captured += HALF_BUFFER_SIZE;
+
+          if (samples_captured >= target_samples) {
+            LogicAnalyzer_StopCapture();
+            flag_capturing = 0U;
+            USB_Transmit_Safe((uint8_t*)stopmsg, strlen(stopmsg));
+          }
+        }
+      }
+    }
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
