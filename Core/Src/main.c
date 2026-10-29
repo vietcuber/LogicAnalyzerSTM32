@@ -50,12 +50,13 @@ typedef struct {
 } PacketHeader_t;
 
 typedef enum {
-  PKT_STREAM_DATA     = 0x01,
-  PKT_SNAPSHOT_DATA   = 0x02,
-  PKT_CONFIG_OK       = 0x10,
-  PKT_CAPTURE_STARTED = 0x11,
-  PKT_CAPTURE_DONE    = 0x12,
-  PKT_ERROR           = 0x7F
+  PKT_STREAM_DATA      = 0x01,
+  PKT_SNAPSHOT_DATA    = 0x02,
+  PKT_CONFIG_OK        = 0x10,
+  PKT_CAPTURE_STARTED  = 0x11,
+  PKT_CAPTURE_DONE     = 0x12,
+  PKT_CAPTURE_STOPPED  = 0x13,
+  PKT_ERROR            = 0x7F
 } PacketType_t;
 
 typedef enum {
@@ -225,6 +226,16 @@ static uint8_t Send_Capture_Done_Packet(uint32_t total_samples) {
   payload[3] = (uint8_t)((total_samples >> 24) & 0xFFU);
 
   return Send_Data_Packet(PKT_CAPTURE_DONE, payload, sizeof(payload));
+}
+static uint8_t Send_Capture_Stopped_Packet(uint32_t total_samples) {
+  uint8_t payload[4];
+
+  payload[0] = (uint8_t)(total_samples & 0xFFU);
+  payload[1] = (uint8_t)((total_samples >> 8) & 0xFFU);
+  payload[2] = (uint8_t)((total_samples >> 16) & 0xFFU);
+  payload[3] = (uint8_t)((total_samples >> 24) & 0xFFU);
+
+  return Send_Data_Packet(PKT_CAPTURE_STOPPED, payload, sizeof(payload));
 }
 
 void My_DMA_HalfConvCallback(DMA_HandleTypeDef *hdma) {
@@ -421,10 +432,32 @@ static uint8_t Copy_Ready_Stream_Block(volatile uint8_t *ready_flag, const uint8
 }
 
 void Process_Command(const char *cmd) {
-	//Re nhanh check CMD la START hay CONFIGURE
-	if (*cmd == 'S') {
-		if (flag_configured == 1U) { // Check da cau hinh hay chua
-			samples_captured = 0U;
+  char trimmed[CMD_BUFFER_SIZE];
+  size_t index = 0U;
+  size_t original_len = strlen(cmd);
+
+  while (index < original_len &&
+         (cmd[index] == ' ' || cmd[index] == '\t' ||
+          cmd[index] == '\r' || cmd[index] == '\n')) {
+    index++;
+  }
+
+  if (index >= original_len) {
+    return;
+  }
+
+  size_t trimmed_len = 0U;
+  while (index + trimmed_len < original_len &&
+         cmd[index + trimmed_len] != '\r' &&
+         cmd[index + trimmed_len] != '\n') {
+    trimmed[trimmed_len] = cmd[index + trimmed_len];
+    trimmed_len++;
+  }
+  trimmed[trimmed_len] = '\0';
+
+  if (strcmp(trimmed, "START") == 0) {
+    if (flag_configured == 1U) {
+      samples_captured = 0U;
 
       if (LogicAnalyzer_StartCapture() == HAL_OK) {
         flag_capturing = 1U;
@@ -439,29 +472,46 @@ void Process_Command(const char *cmd) {
         flag_capturing = 0U;
         (void)Send_Error_Packet(ERR_CAPTURE_START);
       }
-		}
-		else if (flag_configured == 0) { // Neu chua cau hinh thi in loi
-			(void)Send_Error_Packet(ERR_NOT_CONFIGURED);
-		}
-	}
-	//Re nhanh check CMD la START hay CONFIG
-	// Example: CONFIGURE 10000 5000
-	else if (*cmd == 'C') {
-		uint32_t cmd_freq = 0;
-		uint32_t cmd_samples = 0;
-		cmd += 10; // nhay den so thu nhat
-		//Vong lap lay so thu nhat
-		while (*cmd >= '0' && *cmd <= '9') {
-			cmd_freq = cmd_freq * 10 + (*cmd - '0');
-			cmd++;
-		}
-		cmd++; //Bo qua khoang trang giua tan so va so mau
-		//Vong lap lay so thu hai
-		while (*cmd >= '0' && *cmd <= '9') {
-			cmd_samples = cmd_samples * 10 + (*cmd - '0');
-			cmd++;
-		}
-		
+    }
+    else {
+      (void)Send_Error_Packet(ERR_NOT_CONFIGURED);
+    }
+  }
+  else if (strcmp(trimmed, "STOP") == 0) {
+    if (flag_capturing == 1U) {
+      LogicAnalyzer_StopCapture();
+      flag_capturing = 0U;
+      flag_half_ready = 0U;
+      flag_full_ready = 0U;
+
+      if (Send_Capture_Stopped_Packet(samples_captured) != 0U) {
+        (void)Send_Error_Packet(ERR_USB_TRANSMIT);
+      }
+    }
+  }
+  else if (strncmp(trimmed, "CONFIGURE", 9U) == 0) {
+    uint32_t cmd_freq = 0;
+    uint32_t cmd_samples = 0;
+    const char *args = trimmed + 9U;
+
+    while (*args == ' ' || *args == '\t') {
+      args++;
+    }
+
+    while (*args >= '0' && *args <= '9') {
+      cmd_freq = cmd_freq * 10U + (uint32_t)(*args - '0');
+      args++;
+    }
+
+    while (*args == ' ' || *args == '\t') {
+      args++;
+    }
+
+    while (*args >= '0' && *args <= '9') {
+      cmd_samples = cmd_samples * 10U + (uint32_t)(*args - '0');
+      args++;
+    }
+
     uint8_t result = Validate_And_Set_Config(cmd_freq, cmd_samples);
     if (result == 0U) {
       if (Send_Status_Packet(PKT_CONFIG_OK) != 0U) {
@@ -474,7 +524,7 @@ void Process_Command(const char *cmd) {
     else if (result == 2U) {
       (void)Send_Error_Packet(ERR_SNAPSHOT_LIMIT);
     }
-	}
+  }
 }
 
 /* USER CODE END 0 */
