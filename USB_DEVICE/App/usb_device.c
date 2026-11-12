@@ -64,7 +64,20 @@ USBD_HandleTypeDef hUsbDeviceFS;
 void MX_USB_DEVICE_Init(void)
 {
   /* USER CODE BEGIN USB_DEVICE_Init_PreTreatment */
-
+  {
+    /* Pulse PA12 (USB_DP) low briefly so host re-enumerates CDC after SWD reset. */
+    GPIO_InitTypeDef gpio_dp = {0};
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_12, GPIO_PIN_RESET);
+    gpio_dp.Pin = GPIO_PIN_12;
+    gpio_dp.Mode = GPIO_MODE_OUTPUT_PP;
+    gpio_dp.Pull = GPIO_NOPULL;
+    gpio_dp.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(GPIOA, &gpio_dp);
+    HAL_Delay(20);
+    gpio_dp.Mode = GPIO_MODE_INPUT;
+    HAL_GPIO_Init(GPIOA, &gpio_dp);
+  }
   /* USER CODE END USB_DEVICE_Init_PreTreatment */
 
   /* Init Device Library, add supported class and start the library. */

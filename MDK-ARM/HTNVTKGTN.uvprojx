@@ -409,6 +409,26 @@
               <FileType>1</FileType>
               <FilePath>../Core/Src/stm32f1xx_hal_msp.c</FilePath>
             </File>
+            <File>
+              <FileName>la_protocol.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../Core/Src/la_protocol.c</FilePath>
+            </File>
+            <File>
+              <FileName>la_sampling.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../Core/Src/la_sampling.c</FilePath>
+            </File>
+            <File>
+              <FileName>la_trigger.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../Core/Src/la_trigger.c</FilePath>
+            </File>
+            <File>
+              <FileName>la_app.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../Core/Src/la_app.c</FilePath>
+            </File>
           </Files>
         </Group>
         <Group>
