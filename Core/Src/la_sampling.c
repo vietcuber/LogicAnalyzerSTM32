@@ -24,6 +24,13 @@ static uint32_t target_samples = 0U;
 static uint16_t stream_block_size = 1U;
 static uint8_t next_half_index = 0U;
 
+/* Circular DMA trigger state */
+static volatile uint8_t triggered_capture_active = 0U;
+static volatile uint32_t dma_wrap_count = 0U;
+static uint32_t requested_pre_samples = 0U;
+static uint32_t snapshot_start_idx = 0U;
+static uint32_t ring_read_count = 0U;
+
 static const FreqConfig_t Freq_LUT[] = {
   {       1U, 1199U, 59999U },
   {       2U,  599U, 59999U },
@@ -51,10 +58,40 @@ static const uint32_t ALLOWED_SAMPLES[] = {
   100U, 200U, 500U, 1000U, 2000U, 5000U, 10000U, 20000U, 50000U, 100000U
 };
 
+static uint32_t Compute_Ring_Total_Count(uint32_t cndtr, uint32_t dma_isr)
+{
+  uint32_t wraps = dma_wrap_count;
+
+  if (cndtr > LA_BUFFER_SIZE) {
+    cndtr = LA_BUFFER_SIZE;
+  }
+
+  /* Account for a hardware DMA wrap whose TC ISR (lower prio) has not run yet. */
+  if ((dma_isr & DMA_ISR_TCIF5) != 0U && cndtr > (LA_BUFFER_SIZE / 2U)) {
+    wraps++;
+  }
+
+  return (wraps * LA_BUFFER_SIZE) + (LA_BUFFER_SIZE - cndtr);
+}
+
+static uint32_t Read_DMA_Ring_Total_Count(void)
+{
+  DMA_HandleTypeDef *hdma = htim1.hdma[TIM_DMA_ID_UPDATE];
+  return Compute_Ring_Total_Count(hdma->Instance->CNDTR, DMA1->ISR);
+}
+
+static void Stop_TIM3_Counter(void)
+{
+  TIM3->DIER &= ~TIM_DIER_UIE;
+  TIM3->CR1 &= ~TIM_CR1_CEN;
+  TIM3->SR = (uint16_t)(~TIM_SR_UIF);
+  HAL_NVIC_ClearPendingIRQ(TIM3_IRQn);
+}
+
 static void DMA_HalfConvCallback(DMA_HandleTypeDef *hdma)
 {
   (void)hdma;
-  if (current_mode == MODE_STREAMING) {
+  if (triggered_capture_active == 0U && current_mode == MODE_STREAMING) {
     if (flag_half_ready != 0U) {
       flag_stream_overrun = 1U;
     } else {
@@ -66,6 +103,11 @@ static void DMA_HalfConvCallback(DMA_HandleTypeDef *hdma)
 static void DMA_FullConvCallback(DMA_HandleTypeDef *hdma)
 {
   (void)hdma;
+  if (triggered_capture_active != 0U) {
+    dma_wrap_count++;
+    return;
+  }
+
   if (current_mode == MODE_STREAMING) {
     if (flag_full_ready != 0U) {
       flag_stream_overrun = 1U;
@@ -75,6 +117,24 @@ static void DMA_FullConvCallback(DMA_HandleTypeDef *hdma)
   } else {
     flag_snapshot_done = 1U;
   }
+}
+
+void LA_Sampling_Init(void)
+{
+  __HAL_RCC_TIM3_CLK_ENABLE();
+
+  TIM3->CR1 = 0U;
+  TIM3->DIER = 0U;
+  TIM3->PSC = 0U;
+  /* External Clock Mode 1 fed by ITR0 (TIM1_TRGO). */
+  TIM3->SMCR = TIM_SLAVEMODE_EXTERNAL1 | TIM_TS_ITR0;
+  TIM3->SR = 0U;
+
+  /* Keep EXTI & TIM3 at highest priority (0,0); lower DMA & USB below them. */
+  HAL_NVIC_SetPriority(TIM3_IRQn, 0U, 0U);
+  HAL_NVIC_EnableIRQ(TIM3_IRQn);
+  HAL_NVIC_SetPriority(DMA1_Channel5_IRQn, 1U, 0U);
+  HAL_NVIC_SetPriority(USB_LP_CAN1_RX0_IRQn, 2U, 0U);
 }
 
 uint8_t LA_Sampling_Configure(uint32_t freq, uint32_t samples)
@@ -146,25 +206,13 @@ HAL_StatusTypeDef LA_Sampling_Prepare(void)
     return HAL_ERROR;
   }
 
-  HAL_TIM_Base_Stop(&htim1);
-  __HAL_TIM_DISABLE_DMA(&htim1, TIM_DMA_UPDATE);
-  if (hdma->State == HAL_DMA_STATE_BUSY) {
-    (void)HAL_DMA_Abort(hdma);
-  }
+  LA_Sampling_Stop();
+  triggered_capture_active = 0U;
 
   if (current_mode == MODE_SNAPSHOT) {
-    if (target_samples > LA_SNAPSHOT_MAX_SAMPLES || target_samples > LA_BUFFER_SIZE) {
-      return HAL_ERROR;
-    }
     hdma->Init.Mode = DMA_NORMAL;
     dma_length = target_samples;
   } else {
-    if (target_samples > LA_STREAMING_MAX_SAMPLES ||
-        stream_block_size == 0U ||
-        stream_block_size > LA_MAX_PAYLOAD_SIZE ||
-        (2U * (uint32_t)stream_block_size) > LA_BUFFER_SIZE) {
-      return HAL_ERROR;
-    }
     hdma->Init.Mode = DMA_CIRCULAR;
     dma_length = 2U * (uint32_t)stream_block_size;
   }
@@ -196,6 +244,138 @@ HAL_StatusTypeDef LA_Sampling_Prepare(void)
   return HAL_OK;
 }
 
+HAL_StatusTypeDef LA_Sampling_PrepareTriggered(uint8_t pre_trigger_pct)
+{
+  DMA_HandleTypeDef *hdma = htim1.hdma[TIM_DMA_ID_UPDATE];
+  uint32_t pct = (pre_trigger_pct > LA_MAX_PRETRIGGER_PCT)
+                   ? LA_MAX_PRETRIGGER_PCT
+                   : (uint32_t)pre_trigger_pct;
+  uint32_t pre_samples;
+
+  if (flag_configured == 0U || hdma == NULL || target_samples == 0U) {
+    return HAL_ERROR;
+  }
+
+  LA_Sampling_Stop();
+
+  pre_samples = (target_samples * pct) / 100U;
+  if (current_mode == MODE_STREAMING && pre_samples > LA_STREAM_PRE_MAX_SAMPLES) {
+    pre_samples = LA_STREAM_PRE_MAX_SAMPLES;
+  }
+  if (pre_samples >= target_samples) {
+    pre_samples = target_samples - 1U;
+  }
+  requested_pre_samples = pre_samples;
+
+  hdma->Init.Mode = DMA_CIRCULAR;
+  if (HAL_DMA_Init(hdma) != HAL_OK) {
+    return HAL_ERROR;
+  }
+
+  flag_half_ready = 0U;
+  flag_full_ready = 0U;
+  flag_snapshot_done = 0U;
+  flag_stream_overrun = 0U;
+  next_half_index = 0U;
+  dma_wrap_count = 0U;
+  snapshot_start_idx = 0U;
+  ring_read_count = 0U;
+  triggered_capture_active = 1U;
+
+  hdma->XferHalfCpltCallback = NULL;
+  hdma->XferCpltCallback = DMA_FullConvCallback;
+  DMA1->IFCR = DMA_IFCR_CGIF5;
+
+  if (HAL_DMA_Start_IT(hdma,
+                       (uint32_t)&GPIOA->IDR,
+                       (uint32_t)capture_buffer,
+                       LA_BUFFER_SIZE) != HAL_OK) {
+    triggered_capture_active = 0U;
+    return HAL_ERROR;
+  }
+
+  if (current_mode == MODE_SNAPSHOT) {
+    /* Output TIM1 update events on TRGO -> TIM3 ITR0 for exact hardware post-count. */
+    TIM1->CR2 = (TIM1->CR2 & ~TIM_CR2_MMS) | TIM_TRGO_UPDATE;
+  } else {
+    TIM1->CR2 &= ~TIM_CR2_MMS;
+  }
+
+  __HAL_TIM_SET_COUNTER(&htim1, 0U);
+  __HAL_TIM_CLEAR_FLAG(&htim1, TIM_FLAG_UPDATE);
+  __HAL_TIM_ENABLE_DMA(&htim1, TIM_DMA_UPDATE);
+
+  return HAL_TIM_Base_Start(&htim1);
+}
+
+uint32_t LA_Sampling_OnTriggerFired(uint32_t dma_cndtr, uint32_t dma_isr)
+{
+  uint32_t total_armed = Compute_Ring_Total_Count(dma_cndtr, dma_isr);
+  uint32_t actual_pre = (total_armed < requested_pre_samples)
+                          ? total_armed
+                          : requested_pre_samples;
+  uint32_t post_samples = target_samples - actual_pre;
+
+  if (current_mode == MODE_SNAPSHOT) {
+    uint32_t trig_pos = total_armed % LA_BUFFER_SIZE;
+    snapshot_start_idx = (trig_pos + LA_BUFFER_SIZE - actual_pre) % LA_BUFFER_SIZE;
+
+    if (post_samples == 0U) {
+      TIM1->CR1 &= ~TIM_CR1_CEN;
+      flag_snapshot_done = 1U;
+    } else {
+      TIM3->CR1 &= ~TIM_CR1_CEN;
+      TIM3->DIER &= ~TIM_DIER_UIE;
+      TIM3->CNT = 0U;
+      /* ARR = 0 blocks timer counting on STM32F1; requested_pre_samples < target guarantees >= 1. */
+      TIM3->ARR = (post_samples > 1U) ? (uint16_t)(post_samples - 1U) : 1U;
+      TIM3->EGR = TIM_EGR_UG;
+      TIM3->SR = (uint16_t)(~TIM_SR_UIF);
+      HAL_NVIC_ClearPendingIRQ(TIM3_IRQn);
+      TIM3->DIER |= TIM_DIER_UIE;
+      TIM3->CR1 |= TIM_CR1_CEN;
+    }
+  } else {
+    /* Rewind read cursor by actual_pre samples; DMA + TIM1 stay running continuously. */
+    ring_read_count = total_armed - actual_pre;
+  }
+
+  return actual_pre;
+}
+
+void LA_Sampling_OnPostTimerIRQ(void)
+{
+  if ((TIM3->SR & TIM_SR_UIF) != 0U) {
+    TIM3->SR = (uint16_t)(~TIM_SR_UIF);
+    TIM3->DIER &= ~TIM_DIER_UIE;
+    TIM3->CR1 &= ~TIM_CR1_CEN;
+    TIM1->CR1 &= ~TIM_CR1_CEN;
+    if (triggered_capture_active != 0U && current_mode == MODE_SNAPSHOT) {
+      flag_snapshot_done = 1U;
+    }
+  }
+}
+
+uint8_t LA_Sampling_OnDmaIRQ(void)
+{
+  uint32_t primask;
+
+  if (triggered_capture_active == 0U) {
+    return 0U;
+  }
+
+  primask = __get_PRIMASK();
+  __disable_irq();
+  if ((DMA1->ISR & DMA_ISR_TCIF5) != 0U) {
+    DMA1->IFCR = DMA_IFCR_CTCIF5 | DMA_IFCR_CHTIF5;
+    dma_wrap_count++;
+  } else {
+    DMA1->IFCR = DMA_IFCR_CHTIF5;
+  }
+  __set_PRIMASK(primask);
+  return 1U;
+}
+
 HAL_StatusTypeDef LA_Sampling_BeginTimer(void)
 {
   return HAL_TIM_Base_Start(&htim1);
@@ -206,11 +386,14 @@ void LA_Sampling_Stop(void)
   DMA_HandleTypeDef *hdma = htim1.hdma[TIM_DMA_ID_UPDATE];
 
   (void)HAL_TIM_Base_Stop(&htim1);
+  Stop_TIM3_Counter();
+  TIM1->CR2 &= ~TIM_CR2_MMS;
   __HAL_TIM_DISABLE_DMA(&htim1, TIM_DMA_UPDATE);
   if (hdma != NULL && hdma->State == HAL_DMA_STATE_BUSY) {
     (void)HAL_DMA_Abort(hdma);
   }
 
+  triggered_capture_active = 0U;
   flag_half_ready = 0U;
   flag_full_ready = 0U;
   flag_snapshot_done = 0U;
@@ -269,9 +452,80 @@ uint8_t LA_Sampling_CopyNextStreamBlock(uint8_t *dst, uint16_t length)
   return 1U;
 }
 
+uint8_t LA_Sampling_CopyNextTriggeredStreamBlock(uint8_t *dst, uint16_t length)
+{
+  uint32_t primask;
+  uint32_t write_count;
+  uint32_t available;
+  uint32_t start_idx;
+  uint32_t first_part;
+
+  if (length == 0U || length > LA_MAX_PAYLOAD_SIZE || dst == NULL) {
+    return 2U;
+  }
+
+  primask = __get_PRIMASK();
+  __disable_irq();
+  write_count = Read_DMA_Ring_Total_Count();
+  __set_PRIMASK(primask);
+
+  available = write_count - ring_read_count;
+  if (available > LA_BUFFER_SIZE) {
+    return 2U;
+  }
+  if (available < (uint32_t)length) {
+    return 0U;
+  }
+
+  start_idx = ring_read_count % LA_BUFFER_SIZE;
+  first_part = LA_BUFFER_SIZE - start_idx;
+  if (first_part >= (uint32_t)length) {
+    memcpy(dst, &capture_buffer[start_idx], length);
+  } else {
+    memcpy(dst, &capture_buffer[start_idx], first_part);
+    memcpy(&dst[first_part], capture_buffer, (uint32_t)length - first_part);
+  }
+
+  primask = __get_PRIMASK();
+  __disable_irq();
+  write_count = Read_DMA_Ring_Total_Count();
+  __set_PRIMASK(primask);
+
+  if ((write_count - ring_read_count) > LA_BUFFER_SIZE) {
+    return 2U;
+  }
+
+  ring_read_count += (uint32_t)length;
+  return 1U;
+}
+
+void LA_Sampling_CopySnapshotWindow(uint32_t offset, uint8_t *dst, uint16_t length)
+{
+  uint32_t start_idx;
+  uint32_t first_part;
+
+  if (dst == NULL || length == 0U) {
+    return;
+  }
+
+  start_idx = (snapshot_start_idx + offset) % LA_BUFFER_SIZE;
+  first_part = LA_BUFFER_SIZE - start_idx;
+  if (first_part >= (uint32_t)length) {
+    memcpy(dst, &capture_buffer[start_idx], length);
+  } else {
+    memcpy(dst, &capture_buffer[start_idx], first_part);
+    memcpy(&dst[first_part], capture_buffer, (uint32_t)length - first_part);
+  }
+}
+
 uint8_t LA_Sampling_IsConfigured(void)
 {
   return flag_configured;
+}
+
+uint8_t LA_Sampling_IsTriggeredCapture(void)
+{
+  return triggered_capture_active;
 }
 
 CaptureMode_t LA_Sampling_GetMode(void)

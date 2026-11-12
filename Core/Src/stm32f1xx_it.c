@@ -22,6 +22,8 @@
 #include "stm32f1xx_it.h"
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "la_app.h"
+#include "la_sampling.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -205,7 +207,9 @@ void SysTick_Handler(void)
 void DMA1_Channel5_IRQHandler(void)
 {
   /* USER CODE BEGIN DMA1_Channel5_IRQn 0 */
-
+  if (LA_Sampling_OnDmaIRQ() != 0U) {
+    return;
+  }
   /* USER CODE END DMA1_Channel5_IRQn 0 */
   HAL_DMA_IRQHandler(&hdma_tim1_up);
   /* USER CODE BEGIN DMA1_Channel5_IRQn 1 */
@@ -228,35 +232,27 @@ void USB_LP_CAN1_RX0_IRQHandler(void)
 }
 
 /* USER CODE BEGIN 1 */
-void EXTI0_IRQHandler(void)
+static __INLINE void Fast_EXTI_Trigger_Dispatch(void)
 {
-  HAL_GPIO_EXTI_IRQHandler(GPIO_PIN_0);
+  /* Snapshot DMA CNDTR & ISR on ISR entry so trigger index stays sub-microsecond accurate. */
+  uint32_t dma_cndtr = DMA1_Channel5->CNDTR;
+  uint32_t dma_isr = DMA1->ISR;
+  uint32_t pending = EXTI->PR & EXTI->IMR & 0xFFUL;
+  if (pending != 0U) {
+    EXTI->PR = pending;
+    LA_App_HandleExtiTrigger((uint16_t)pending, dma_cndtr, dma_isr);
+  }
 }
 
-void EXTI1_IRQHandler(void)
-{
-  HAL_GPIO_EXTI_IRQHandler(GPIO_PIN_1);
-}
+void EXTI0_IRQHandler(void)   { Fast_EXTI_Trigger_Dispatch(); }
+void EXTI1_IRQHandler(void)   { Fast_EXTI_Trigger_Dispatch(); }
+void EXTI2_IRQHandler(void)   { Fast_EXTI_Trigger_Dispatch(); }
+void EXTI3_IRQHandler(void)   { Fast_EXTI_Trigger_Dispatch(); }
+void EXTI4_IRQHandler(void)   { Fast_EXTI_Trigger_Dispatch(); }
+void EXTI9_5_IRQHandler(void) { Fast_EXTI_Trigger_Dispatch(); }
 
-void EXTI2_IRQHandler(void)
+void TIM3_IRQHandler(void)
 {
-  HAL_GPIO_EXTI_IRQHandler(GPIO_PIN_2);
-}
-
-void EXTI3_IRQHandler(void)
-{
-  HAL_GPIO_EXTI_IRQHandler(GPIO_PIN_3);
-}
-
-void EXTI4_IRQHandler(void)
-{
-  HAL_GPIO_EXTI_IRQHandler(GPIO_PIN_4);
-}
-
-void EXTI9_5_IRQHandler(void)
-{
-  HAL_GPIO_EXTI_IRQHandler(GPIO_PIN_5);
-  HAL_GPIO_EXTI_IRQHandler(GPIO_PIN_6);
-  HAL_GPIO_EXTI_IRQHandler(GPIO_PIN_7);
+  LA_Sampling_OnPostTimerIRQ();
 }
 /* USER CODE END 1 */

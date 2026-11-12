@@ -25,6 +25,11 @@ void LA_App_Poll(void);
  */
 void LA_App_OnRxBytes(const uint8_t *buf, uint32_t len);
 
+/**
+ * @brief Fast EXTI trigger entry point invoked directly from EXTI0..9_5 ISRs.
+ */
+void LA_App_HandleExtiTrigger(uint16_t pending_pins, uint32_t dma_cndtr, uint32_t dma_isr);
+
 #ifdef __cplusplus
 }
 #endif
